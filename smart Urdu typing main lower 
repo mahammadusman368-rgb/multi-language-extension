@@ -1,0 +1,63 @@
+-- Extension Name: Urdu Voice Typing
+-- Creator: Mohammad Usman
+-- Version: 3.0 (Urdu Only - Final & Stable)
+
+require "import"
+import "android.content.Intent"
+import "android.speech.SpeechRecognizer"
+import "android.speech.RecognitionListener"
+import "android.speech.RecognizerIntent"
+import "android.view.accessibility.AccessibilityNodeInfo"
+import "java.util.Locale"
+
+-- 1. Fixed Language (Urdu - Pakistan only)
+local langCode = "ur-PK"
+
+-- 2. UNIVERSAL FOCUS FINDER (Stable for all Androids)
+local function getUniversalFocus()
+  local root = service.getRootInActiveWindow()
+  if not root then return service.getEditText() end
+  local focusedNode = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+  if focusedNode and (focusedNode.isEditable() or focusedNode.getClassName() == "android.widget.EditText") then
+    return focusedNode
+  end
+  return service.getEditText()
+end
+
+-- 3. VOICE RECOGNITION ENGINE (Urdu Only)
+local function startVoiceTyping(targetBox)
+  pcall(function()
+    local speechRec = SpeechRecognizer.createSpeechRecognizer(service.getContext())
+    local listener = RecognitionListener {
+      onResults = function(results)
+        local resultsArray = results.getParcelableArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+        if resultsArray and resultsArray.size() > 0 then
+          local spokenText = tostring(resultsArray.get(0))
+          service.insertText(targetBox, spokenText .. " ")
+        end
+        speechRec.destroy()
+        collectgarbage("collect")
+      end,
+      onError = function()
+        service.asyncSpeak("Nahi samjha, dobara boliye")
+        speechRec.destroy()
+      end,
+    }
+
+    local intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+    intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+    intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, langCode)
+    intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+
+    speechRec.setRecognitionListener(listener)
+    speechRec.startListening(intent)
+  end)
+end
+
+-- 4. EXECUTION
+pcall(function()
+  local target = getUniversalFocus()
+  if target then
+    startVoiceTyping(target)
+  end
+end)
