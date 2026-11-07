@@ -1,1 +1,1024 @@
- 
+require "import"
+import "android.widget.*"
+import "android.content.Intent"
+import "android.content.ClipData"
+import "android.speech.SpeechRecognizer"
+import "android.speech.RecognitionListener"
+import "android.speech.RecognizerIntent"
+import "android.view.View"
+import "android.content.Context"
+import "android.os.Bundle"
+import "android.os.Vibrator"
+import "android.net.Uri"
+import "com.androlua.Http"
+import "cjson"
+
+-- ==================== FAST AI VOICE & TRANSLATOR CONFIG ====================
+local AI_PREFS = "FastAIVoiceTranslator"
+local aiPrefs = service.getSharedPreferences(AI_PREFS, Context.MODE_PRIVATE)
+local aiEditor = aiPrefs.edit()
+
+-- Developer Custom Support Details
+local devName = "Creator: Mohammad Usman"
+local devWhatsApp = "+923000000000" -- یہاں آپ اپنا مطلوبہ واٹس ایپ نمبر تبدیل کر سکتے ہیں
+
+-- Selected Mode (default: "conversion" or "intelligent")
+local selectedMode = "conversion"
+
+-- Translate Switch State (for speech translation: input language -> target language)
+local translateEnabled = false
+local targetLanguage = "en-US"  -- Default target language for translation
+local targetLanguageName = "English"
+
+-- Screen Text Translator Switch State
+local screenTranslateEnabled = false
+
+-- Groq Models
+local GROQ_MODELS = {
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "mixtral-8x7b-32768",
+    "gemma2-9b-it",
+    "llama-guard-3-8b"
+}
+
+-- Getter / Setter Global Functions
+function getGroqApiKey() return aiPrefs.getString("groq_apiKey", "") end
+function saveGroqApiKey(key) aiEditor.putString("groq_apiKey", key); aiEditor.commit() end
+function getGroqModel() return aiPrefs.getString("groq_model", "llama-3.3-70b-versatile") end
+function saveGroqModel(model) aiEditor.putString("groq_model", model); aiEditor.commit() end
+function getSelectedMode() return aiPrefs.getString("selected_mode", "conversion") end
+function setSelectedMode(mode) aiEditor.putString("selected_mode", mode); aiEditor.commit(); selectedMode = mode end
+function isTranslateEnabled() return aiPrefs.getBoolean("translate_enabled", false) end
+function setTranslateEnabled(enabled) aiEditor.putBoolean("translate_enabled", enabled); aiEditor.commit(); translateEnabled = enabled end
+function isScreenTranslateEnabled() return aiPrefs.getBoolean("screen_translate_enabled", false) end
+function setScreenTranslateEnabled(enabled) aiEditor.putBoolean("screen_translate_enabled", enabled); aiEditor.commit(); screenTranslateEnabled = enabled end
+function getTargetLanguage() return aiPrefs.getString("target_language", "en-US") end
+function setTargetLanguage(code) aiEditor.putString("target_language", code); aiEditor.commit(); targetLanguage = code end
+function getTargetLanguageName() return aiPrefs.getString("target_language_name", "English") end
+function setTargetLanguageName(name) aiEditor.putString("target_language_name", name); aiEditor.commit(); targetLanguageName = name end
+
+-- Vibrate & Smart Emoji Getters / Setters
+function isVibrateEnabled() return aiPrefs.getBoolean("vibrate_enabled", true) end
+-- وائبریشن ٹوگل فنکشن
+function setVibrateEnabled(enabled) aiEditor.putBoolean("vibrate_enabled", enabled); aiEditor.commit() end
+function isSmartEmojiEnabled() return aiPrefs.getBoolean("smart_emoji_enabled", false) end
+-- اسمارٹ ایموجی ٹوگل فنکشن
+function setSmartEmojiEnabled(enabled) aiEditor.putBoolean("smart_emoji_enabled", enabled); aiEditor.commit() end
+
+-- وائبریشن ایگزیکیوشن لاجک
+function triggerVibration()
+    if isVibrateEnabled() then
+        local vibrator = service.getSystemService(Context.VIBRATOR_SERVICE)
+        if vibrator then
+            vibrator.vibrate(50) -- 50 Milliseconds ہپٹک فیڈ بیک
+        end
+    end
+end
+
+function testGroqAPI(apiKey, callback)
+    local url = "https://api.groq.com/openai/v1/models"
+    local headers = {
+        ["Authorization"] = "Bearer " .. apiKey
+    }
+    
+    Http.get(url, headers, function(status, data)
+        if status == 200 then
+            callback(true, "آپ کی API کی درست ہے!")
+        elseif status == 401 then
+            callback(false, "Sorry آپ کی API کی درست نہیں ہے")
+        else
+            callback(false, "کنکشن کا مسئلہ یا غلط کی! اسٹیٹس کوڈ: " .. status)
+        end
+    end)
+end
+
+function callGroqAPI(apiKey, model, systemPrompt, userPrompt, callback)
+    local url = "https://api.groq.com/openai/v1/chat/completions"
+    local headers = {
+        ["Content-Type"] = "application/json",
+        ["Authorization"] = "Bearer " .. apiKey,
+    }
+    
+    local messages = {}
+    if systemPrompt and systemPrompt ~= "" then
+        table.insert(messages, {role = "system", content = systemPrompt})
+    end
+    table.insert(messages, {role = "user", content = userPrompt})
+    
+    local payload = {
+        model = model,
+        messages = messages,
+        max_tokens = 1024,
+        temperature = 0.7
+    }
+    
+    Http.post(url, cjson.encode(payload), headers, function(status, data)
+        if status == 200 then
+            local ok, decoded = pcall(cjson.decode, data)
+            if ok and decoded and decoded.choices and decoded.choices[1] then
+                local text = decoded.choices[1].message.content
+                if text then
+                    callback(text, nil)
+                else
+                    callback(nil, "Invalid response from Groq")
+                end
+            else
+                callback(nil, "Failed to parse Groq response")
+            end
+        elseif status == 401 then
+            callback(nil, "Invalid API key. Please check your Groq API key")
+        elseif status == 429 then
+            callback(nil, "Rate limit exceeded. Please wait or check your quota")
+        else
+            callback(nil, "Groq Error: " .. status)
+        end
+    end)
+end
+
+-- Conversion Mode Prompt (Mix Language)
+function getConversionModePrompt()
+    return [[Task: Act as a multilingual text processor. Your goal is to convert incoming text into a "Mixed Script" format.
+Rule 1: Keep the sentence structure and grammar in the original language (Urdu or Hindi).
+Rule 2: Identify proper nouns (names, places), technical terms, and common English loanwords.
+Rule 3: Convert only those identified words into English spellings (Latin alphabet). All other words must remain in Urdu (Persian-Arabic script) or Hindi (Devanagari script).
+Rule 4: Do not translate the entire sentence; only change the script of specific words.
+Rule 5: Return only the converted text without any extra explanation.
+
+Examples:
+Input: میرا نام ثابر جمیل ہے۔
+Output: میرا نام Sabir Jamil ہے۔
+
+Input: میں پاکستان میں رہتا ہوں۔
+Output: میں Pakistan میں رہتا ہوں۔
+
+Input: میں ایک سٹوڈنٹ ہوں اور محنت کرتا ہوں۔
+Output: میں ایک Student ہوں اور محنت کرتا ہوں۔
+
+Input: آج کا موسم بہت اچھا ہے۔
+Output: آج کا Weather بہت اچھا ہے۔
+
+Input: مجھے اپنی سکلز کو بہتر بنانا ہے۔
+Output: مجھے اپنی Skills کو بہتر بنانا ہے۔]]
+end
+
+-- Intelligent Writer Mode Prompt (Enhancement)
+function getIntelligentWriterPrompt()
+    return [[Task: Act as an AI Writing Assistant and Content Improver.
+Goal: Enhance the user's input text to make it more professional, articulate, and engaging while preserving the original meaning.
+Instructions: Correct any grammatical errors, improve vocabulary choices, and refine the tone. Ensure the output is natural and flows better than the original input. Provide only the enhanced version of the text without any extra explanation.]]
+end
+
+-- Translation Prompt (from any language to target language)
+function getTranslationPrompt(targetLangCode, targetLangName)
+    local languageMap = {
+        ["en-US"] = "English", ["ur-PK"] = "Urdu", ["hi-IN"] = "Hindi", ["ar-SA"] = "Arabic",
+        ["es-ES"] = "Spanish", ["fr-FR"] = "French", ["de-DE"] = "German", ["zh-CN"] = "Chinese",
+        ["ja-JP"] = "Japanese", ["tr-TR"] = "Turkish", ["ru-RU"] = "Russian", ["pt-BR"] = "Portuguese",
+        ["it-IT"] = "Italian", ["nl-NL"] = "Dutch"
+    }
+    local targetLang = languageMap[targetLangCode] or targetLangName or "English"
+    
+    return [[Task: Act as a professional translator. Your goal is to translate the given text into ]] .. targetLang .. [[ language.
+Instructions: 
+1. Identify the source language of the input text automatically.
+2. Translate the entire text accurately into ]] .. targetLang .. [[.
+3. Keep the meaning, tone, and context intact.
+4. Return ONLY the translation without any extra explanation, comments, or quotes.
+5. If the text is already in ]] .. targetLang .. [[, return it as-is.]]
+end
+
+-- Screen Content to Urdu Translator Prompt
+function getScreenTranslationPrompt()
+    return [[Task: Act as an Urdu interpreter for accessibility screen reading. 
+Instructions: 
+1. Read the input text which can be in any language (English, Arabic, etc.).
+2. Translate it accurately into clear, natural Urdu (Pakistan) language.
+3. Provide ONLY the final Urdu translation text. No notes, no explanations, no original text.]]
+end
+
+function processWithAI(spokenText, callback)
+    local apiKey = getGroqApiKey()
+    
+    if not apiKey or apiKey == "" then
+        service.speak("Please set Groq API key in AI Engine settings first")
+        callback(spokenText)
+        return
+    end
+    
+    local model = getGroqModel()
+    local mode = getSelectedMode()
+    local systemPrompt = ""
+    
+    if mode == "conversion" then
+        systemPrompt = getConversionModePrompt()
+        service.speak("Conversion Mode active")
+    else
+        systemPrompt = getIntelligentWriterPrompt()
+        service.speak("Intelligent Writer Mode active")
+    end
+    
+    -- اگر اسمارٹ ایموجی سوئچ آن ہو تو پرامپٹ میں ہر لفظ کو اسکین کر کے ایموجی لگانے کی انسٹرکشن شامل کریں
+    if isSmartEmojiEnabled() then
+        systemPrompt = systemPrompt .. "\nAdditional Rule: Scan every single word meticulously. Based on the exact meaning of each word, attach a highly relevant, context-aware emoji immediately after it. Ensure every appropriate word is enhanced with an emoji."
+    end
+    
+    callGroqAPI(apiKey, model, systemPrompt, spokenText, function(result, error)
+        if error then
+            service.speak(error)
+            callback(spokenText)
+        else
+            callback(result)
+        end
+    end)
+end
+
+function translateSpeechToTarget(spokenText, callback)
+    local apiKey = getGroqApiKey()
+    
+    if not apiKey or apiKey == "" then
+        callback("Please set Groq API key in AI Engine settings first")
+        return
+    end
+    
+    local model = getGroqModel()
+    local targetLangCode = getTargetLanguage()
+    local targetLangName = getTargetLanguageName()
+    local systemPrompt = getTranslationPrompt(targetLangCode, targetLangName)
+    
+    if isSmartEmojiEnabled() then
+        systemPrompt = systemPrompt .. "\nAdditional Rule: Scan every single translated word meticulously. Based on the exact meaning of each word, attach a highly relevant, context-aware emoji immediately after it."
+    end
+    
+    callGroqAPI(apiKey, model, systemPrompt, spokenText, function(result, error)
+        if error then
+            callback("Translation error: " .. error)
+        else
+            callback(result)
+        end
+    end)
+end
+
+function translateScreenFocusText()
+    if not isScreenTranslateEnabled() then
+        return false
+    end
+
+    local screenText = ""
+    if node then
+        screenText = node.text or node.contentDescription
+    end
+    
+    if not screenText or tostring(screenText) == "" or tostring(screenText) == "nil" then
+        local clipboard = service.getSystemService(Context.CLIPBOARD_SERVICE)
+        if clipboard and clipboard.hasPrimaryClip() then
+            local clipData = clipboard.getPrimaryClip()
+            if clipData and clipData.getItemCount() > 0 then
+                screenText = clipData.getItemAt(0).getText()
+            end
+        end
+    end
+
+    if not screenText or tostring(screenText) == "" or tostring(screenText) == "nil" then
+        service.speak("Focused element has no text")
+        return false
+    end
+    
+    screenText = tostring(screenText)
+
+    local apiKey = getGroqApiKey()
+    if not apiKey or apiKey == "" then
+        service.speak("Please set Groq API key for screen translation")
+        return false
+    end
+
+    service.speak("Translating screen text...")
+    local model = getGroqModel()
+    local systemPrompt = getScreenTranslationPrompt()
+
+    callGroqAPI(apiKey, model, systemPrompt, screenText, function(result, error)
+        if error then
+            service.speak("Error: " .. error)
+        else
+            service.speak(result)
+        end
+    end)
+    return true
+end
+
+function showModesDialog(parentDlg)
+    triggerVibration()
+    local dlg = LuaDialog(service)
+    dlg.setTitle("Select Typing Mode")
+    dlg.setCancelable(true)
+    
+    local layout = {
+        LinearLayout;
+        orientation = "vertical";
+        padding = "30dp";
+        {
+            Button;
+            text = "Conversion Mode (Mix Language)";
+            textSize = "16sp";
+            layout_width = "fill";
+            layout_marginBottom = "15dp";
+            onClick = function()
+                triggerVibration()
+                setSelectedMode("conversion")
+                service.speak("Conversion Mode selected")
+                dlg.dismiss()
+                if parentDlg then parentDlg.show() end
+            end;
+        };
+        {
+            Button;
+            text = "Intelligent Writer Mode (Enhancement)";
+            textSize = "16sp";
+            layout_width = "fill";
+            layout_marginBottom = "15dp";
+            onClick = function()
+                triggerVibration()
+                setSelectedMode("intelligent")
+                service.speak("Intelligent Writer Mode selected")
+                dlg.dismiss()
+                if parentDlg then parentDlg.show() end
+            end;
+        };
+        {
+            Button;
+            text = "← GO BACK";
+            textSize = "16sp";
+            layout_width = "fill";
+            backgroundColor = "#FF4444";
+            textColor = "#FFFFFF";
+            onClick = function()
+                triggerVibration()
+                dlg.dismiss()
+                if parentDlg then parentDlg.show() end
+            end;
+        };
+    }
+    
+    dlg.setView(loadlayout(layout))
+    dlg.show()
+end
+
+function showTranslateLanguageDialog(parentDlg)
+    triggerVibration()
+    local translateItems = {
+        "English", "Urdu", "Hindi", "Arabic", "Spanish", "French", "German",
+        "Chinese", "Japanese", "Turkish", "Russian", "Portuguese", "Italian", "Dutch"
+    }
+    
+    local translateCodes = {
+        "en-US", "ur-PK", "hi-IN", "ar-SA", "es-ES", "fr-FR", "de-DE",
+        "zh-CN", "ja-JP", "tr-TR", "ru-RU", "pt-BR", "it-IT", "nl-NL"
+    }
+    
+    local dlg = LuaDialog(service)
+    dlg.setTitle("Select Target Language for Translation")
+    local list = ListView(service)
+    list.setAdapter(ArrayAdapter(service, android.R.layout.simple_list_item_1, translateItems))
+    list.onItemClick = function(l, v, p, i)
+        triggerVibration()
+        local selectedCode = translateCodes[p+1]
+        local selectedName = translateItems[p+1]
+        setTargetLanguage(selectedCode)
+        setTargetLanguageName(selectedName)
+        dlg.dismiss()
+        if parentDlg then parentDlg.show() end
+        service.speak("Translation target set to: " .. selectedName)
+    end
+    dlg.setView(list)
+    dlg.show()
+end
+
+-- ==================== NEW CUSTOM SUBSYSTEMS & DIALOGS ====================
+
+-- 1. SETTINGS MENU
+function showSettingsSubMenu(parentDlg)
+    triggerVibration()
+    local dlg = LuaDialog(service)
+    dlg.setTitle("Settings Menu")
+    dlg.setCancelable(true)
+    
+    local isVibrate = isVibrateEnabled()
+    local isSmartEmoji = isSmartEmojiEnabled()
+    
+    local layout = {
+        LinearLayout;
+        orientation = "vertical";
+        padding = "30dp";
+        {
+            Button;
+            text = "Select Engine (Models)";
+            textSize = "16sp";
+            layout_width = "fill";
+            layout_marginBottom = "12dp";
+            onClick = function()
+                triggerVibration()
+                dlg.dismiss()
+                showAISettingsDialog(dlg)
+            end;
+        };
+        {
+            Button;
+            text = "Set API Key";
+            textSize = "16sp";
+            layout_width = "fill";
+            layout_marginBottom = "15dp";
+            onClick = function()
+                triggerVibration()
+                dlg.dismiss()
+                showApiKeySubMenu(dlg)
+            end;
+        };
+        {
+            CheckBox;
+            id = "vibrateCheck";
+            text = "Enable Typing Vibration";
+            textSize = "15sp";
+            checked = isVibrate;
+            layout_width = "fill";
+            layout_marginBottom = "12dp";
+            onClick = function()
+                local checkedState = vibrateCheck.isChecked()
+                setVibrateEnabled(checkedState)
+                triggerVibration()
+                service.speak(checkedState and "Vibration Enabled" or "Vibration Disabled")
+            end;
+        };
+        {
+            CheckBox;
+            id = "emojiCheck";
+            text = "Smart Emoji (Auto Word Scan)";
+            textSize = "15sp";
+            checked = isSmartEmoji;
+            layout_width = "fill";
+            layout_marginBottom = "25dp";
+            onClick = function()
+                triggerVibration()
+                local checkedState = emojiCheck.isChecked()
+                setSmartEmojiEnabled(checkedState)
+                service.speak(checkedState and "Smart Emoji Enabled" or "Smart Emoji Disabled")
+            end;
+        };
+        {
+            Button;
+            text = "← GO BACK";
+            textSize = "16sp";
+            layout_width = "fill";
+            backgroundColor = "#FF4444";
+            textColor = "#FFFFFF";
+            onClick = function()
+                triggerVibration()
+                dlg.dismiss()
+                if parentDlg then parentDlg.show() end
+            end;
+        };
+    }
+    dlg.setView(loadlayout(layout))
+    dlg.show()
+end
+
+-- 2. FIXED API KEY SUB MENU (Prevents Button Gap)
+function showApiKeySubMenu(parentDlg)
+    triggerVibration()
+    local dlg = LuaDialog(service)
+    dlg.setTitle("API Key Setup")
+    dlg.setCancelable(true)
+    
+    local currentKey = getGroqApiKey()
+    
+    -- روٹ لینیئر لے آؤٹ
+    local rootLayout = LinearLayout(service)
+    rootLayout.setOrientation(LinearLayout.VERTICAL)
+    rootLayout.setPadding(40, 40, 40, 40)
+    
+    local keyHintText = TextView(service)
+    keyHintText.setText("Enter or Paste your Groq API Key:")
+    keyHintText.setTextSize(14)
+    keyHintText.setTextColor(0xFFFFFFFF)
+    keyHintText.setPadding(0, 0, 0, 10)
+    rootLayout.addView(keyHintText)
+    
+    -- ایڈٹ ٹیکسٹ باکس
+    local apiKeyInput = EditText(service)
+    apiKeyInput.setHint("Paste API Key here...")
+    apiKeyInput.setText(currentKey)
+    apiKeyInput.setTextSize(14)
+    apiKeyInput.setPadding(20, 20, 20, 20)
+    apiKeyInput.setBackgroundColor(0xFF222222)
+    apiKeyInput.setTextColor(0xFFFFFFFF)
+    apiKeyInput.setInputType(129) -- تا کہ ٹیکسٹ پاس ورڈ فیلڈ کی طرح محفوظ رہے
+    
+    local inputParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+    inputParams.setMargins(0, 0, 0, 30)
+    apiKeyInput.setLayoutParams(inputParams)
+    rootLayout.addView(apiKeyInput)
+    
+    -- مستقل بٹن رو (Horizontal Layout)
+    local actionsRow = LinearLayout(service)
+    actionsRow.setOrientation(LinearLayout.HORIZONTAL)
+    actionsRow.setLayoutParams(LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+    
+    -- ٹیسٹ بٹن لاجک
+    local testBtn = Button(service)
+    testBtn.setText("Test API Key")
+    testBtn.setTextSize(11)
+    testBtn.setBackgroundColor(0xFF2196F3)
+    testBtn.setTextColor(0xFFFFFFFF)
+    local btnParams1 = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0)
+    btnParams1.setMargins(0, 0, 8, 0)
+    testBtn.setLayoutParams(btnParams1)
+    
+    -- سیو بٹن لاجک
+    local saveBtn = Button(service)
+    saveBtn.setText("Save Key")
+    saveBtn.setTextSize(11)
+    saveBtn.setBackgroundColor(0xFF4CAF50)
+    saveBtn.setTextColor(0xFFFFFFFF)
+    local btnParams2 = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0)
+    btnParams2.setMargins(0, 0, 8, 0)
+    saveBtn.setLayoutParams(btnParams2)
+    
+    -- بیک بٹن لاجک
+    local backBtn = Button(service)
+    backBtn.setText("Go Back")
+    backBtn.setTextSize(11)
+    backBtn.setBackgroundColor(0xFFE91E63)
+    backBtn.setTextColor(0xFFFFFFFF)
+    local btnParams3 = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0)
+    backBtn.setLayoutParams(btnParams3)
+    
+    testBtn.setOnClickListener(function(view)
+        triggerVibration()
+        local inputtedKey = apiKeyInput.getText().toString():gsub("%s+", "")
+        if inputtedKey == "" then
+            service.speak("ایڈیٹر باکس خالی ہے، پہلے کی درج کریں")
+        else
+            service.speak("API کی چیک کی جا رہی ہے، براہ کرم انتظار کریں...")
+            testGroqAPI(inputtedKey, function(success, message)
+                service.speak(message)
+            end)
+        end
+    end)
+    
+    saveBtn.setOnClickListener(function(view)
+        triggerVibration()
+        local inputtedKey = apiKeyInput.getText().toString():gsub("%s+", "")
+        if inputtedKey ~= "" then
+            saveGroqApiKey(inputtedKey)
+            service.speak("API Key مستقل طور پر محفوظ کر دی گئی ہے")
+        else
+            service.speak("ایڈیٹر باکس میں کوئی کی موجود نہیں ہے، اس لیے محفوظ نہیں کیا جا سکتا")
+        end
+    end)
+    
+    backBtn.setOnClickListener(function(view)
+        triggerVibration()
+        dlg.dismiss()
+        if parentDlg then parentDlg.show() end
+    end)
+    
+    actionsRow.addView(testBtn)
+    actionsRow.addView(saveBtn)
+    actionsRow.addView(backBtn)
+    
+    rootLayout.addView(actionsRow)
+    dlg.setView(rootLayout)
+    dlg.show()
+end
+
+-- 3. ABOUT & SUPPORT MENU WITH WHATSAPP INTEGRATION
+function showAboutSupportMenu(parentDlg)
+    triggerVibration()
+    local dlg = LuaDialog(service)
+    dlg.setTitle("About & Support")
+    dlg.setCancelable(true)
+    
+    local mainLayout = LinearLayout(service)
+    mainLayout.setOrientation(LinearLayout.VERTICAL)
+    mainLayout.setPadding(40, 40, 40, 40)
+    
+    local nameText = TextView(service)
+    nameText.setText(devName)
+    nameText.setTextSize(18)
+    nameText.setTextColor(0xFFFFFFFF)
+    nameText.setGravity(Gravity.CENTER)
+    nameText.setPadding(0, 0, 0, 10)
+    mainLayout.addView(nameText)
+    
+    local numText = TextView(service)
+    numText.setText("WhatsApp: " .. devWhatsApp)
+    numText.setTextSize(15)
+    numText.setTextColor(0xFFAAAAAA)
+    numText.setGravity(Gravity.CENTER)
+    numText.setPadding(0, 0, 0, 30)
+    mainLayout.addView(numText)
+    
+    local rowLayout = LinearLayout(service)
+    rowLayout.setOrientation(LinearLayout.HORIZONTAL)
+    rowLayout.setLayoutParams(LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+    
+    local copyBtn = Button(service)
+    copyBtn.setText("Copy Number")
+    copyBtn.setTextSize(11)
+    copyBtn.setBackgroundColor(0xFF607D8B)
+    copyBtn.setTextColor(0xFFFFFFFF)
+    local p1 = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0)
+    p1.setMargins(0, 0, 8, 0)
+    copyBtn.setLayoutParams(p1)
+    
+    local contactBtn = Button(service)
+    contactBtn.setText("Contact WhatsApp")
+    contactBtn.setTextSize(11)
+    contactBtn.setBackgroundColor(0xFF00E676)
+    contactBtn.setTextColor(0xFFFFFFFF)
+    local p2 = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0)
+    p2.setMargins(0, 0, 8, 0)
+    contactBtn.setLayoutParams(p2)
+    
+    local backBtn = Button(service)
+    backBtn.setText("Go Back")
+    backBtn.setTextSize(11)
+    backBtn.setBackgroundColor(0xFFFF5722)
+    backBtn.setTextColor(0xFFFFFFFF)
+    local p3 = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0)
+    backBtn.setLayoutParams(p3)
+    
+    copyBtn.setOnClickListener(function(v)
+        triggerVibration()
+        local clipboard = service.getSystemService(Context.CLIPBOARD_SERVICE)
+        local clip = ClipData.newPlainText("WhatsApp Number", devWhatsApp)
+        clipboard.setPrimaryClip(clip)
+        service.speak("واٹس ایپ نمبر کلپ بورڈ میں کاپی ہو گیا ہے")
+    end)
+    
+    contactBtn.setOnClickListener(function(v)
+        triggerVibration()
+        local cleanNumber = devWhatsApp:gsub("%+", ""):gsub("%s+", "")
+        local url = "https://wa.me/" .. cleanNumber
+        local intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+        intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        pcall(function()
+            service.startActivity(intent)
+        end)
+    end)
+    
+    backBtn.setOnClickListener(function(v)
+        triggerVibration()
+        dlg.dismiss()
+        if parentDlg then parentDlg.show() end
+    end)
+    
+    rowLayout.addView(copyBtn)
+    rowLayout.addView(contactBtn)
+    rowLayout.addView(backBtn)
+    mainLayout.addView(rowLayout)
+    
+    dlg.setView(mainLayout)
+    dlg.show()
+end
+
+-- ==================== EXISTING MODIFIED DIALOGS ====================
+function showAISettingsDialog(mainDlg)
+    triggerVibration()
+    local dlg = LuaDialog(service)
+    dlg.setTitle("Groq Model Engine")
+    dlg.setCancelable(true)
+    
+    local mainLayout = LinearLayout(service)
+    mainLayout.setOrientation(1)
+    mainLayout.setPadding(30, 20, 30, 20)
+    
+    local modelLabel = TextView(service)
+    modelLabel.setText("Select Model:")
+    modelLabel.setTextSize(14)
+    modelLabel.setTextColor(0xFFFFFFFF)
+    modelLabel.setPadding(0, 0, 0, 10)
+    mainLayout.addView(modelLabel)
+    
+    local modelSpinner = Spinner(service)
+    local adapter = ArrayAdapter(service, android.R.layout.simple_spinner_item, GROQ_MODELS)
+    adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+    modelSpinner.setAdapter(adapter)
+    
+    local currentModel = getGroqModel()
+    for i = 1, #GROQ_MODELS do
+        if GROQ_MODELS[i] == currentModel then
+            modelSpinner.setSelection(i - 1)
+            break
+        end
+    end
+    local spinnerParams = LinearLayout.LayoutParams(-1, -2)
+    spinnerParams.setMargins(0, 0, 0, 15)
+    modelSpinner.setLayoutParams(spinnerParams)
+    mainLayout.addView(modelSpinner)
+    
+    local buttonRow = LinearLayout(service)
+    buttonRow.setOrientation(0)
+    
+    local saveBtn = Button(service)
+    saveBtn.setText("SAVE MODEL")
+    saveBtn.setTextSize(12)
+    saveBtn.setBackgroundColor(0xFF4CAF50)
+    saveBtn.setPadding(0, 15, 0, 15)
+    saveBtn.setLayoutParams(LinearLayout.LayoutParams(0, -2, 1))
+    
+    local backBtn = Button(service)
+    backBtn.setText("GO BACK")
+    backBtn.setTextSize(12)
+    backBtn.setBackgroundColor(0xFFF44336)
+    backBtn.setPadding(0, 15, 0, 15)
+    backBtn.setLayoutParams(LinearLayout.LayoutParams(0, -2, 1))
+    
+    buttonRow.addView(saveBtn)
+    buttonRow.addView(backBtn)
+    mainLayout.addView(buttonRow)
+    
+    saveBtn.setOnClickListener(function()
+        triggerVibration()
+        local newModel = GROQ_MODELS[modelSpinner.getSelectedItemPosition() + 1]
+        if newModel then saveGroqModel(newModel) end
+        service.speak("ماڈل محفوظ کر لیا گیا ہے")
+        dlg.dismiss()
+        if mainDlg then mainDlg.show() end
+    end)
+    
+    backBtn.setOnClickListener(function()
+        triggerVibration()
+        dlg.dismiss()
+        if mainDlg then mainDlg.show() end
+    end)
+    
+    local scrollView = ScrollView(service)
+    scrollView.addView(mainLayout)
+    dlg.setView(scrollView)
+    dlg.show()
+end
+
+local dictFile = os.getenv("EXTERNAL_STORAGE") .. "/fast_ai_voice_translator_dict.dat"
+local changeTable = {}
+
+function loadDictionary()
+    local f = io.open(dictFile, "r")
+    if f then
+        local content = f:read("*all")
+        f:close()
+        if content and content ~= "" then
+            local ok, result = pcall(cjson.decode, content)
+            if ok and type(result) == "table" then
+                changeTable = result
+            end
+        end
+    end
+end
+
+function saveDictionary()
+    local f = io.open(dictFile, "w")
+    if f then
+        f:write(cjson.encode(changeTable))
+        f:close()
+    end
+end
+
+function addToDictionary(wrongWord, correctWord)
+    if wrongWord and correctWord and wrongWord ~= "" and correctWord ~= "" then
+        changeTable[wrongWord] = correctWord
+        saveDictionary()
+        return true
+    end
+    return false
+end
+
+function getSavedLanguage()
+    local langFile = os.getenv("EXTERNAL_STORAGE") .. "/fast_ai_voice_translator_lang.dat"
+    local f = io.open(langFile, "r")
+    if f then
+        local content = f:read("*all")
+        f:close()
+        if content and content ~= "" then
+            return content:gsub("%s+", "")
+        end
+    end
+    return "ur-PK"
+end
+
+function saveLanguage(code)
+    local langFile = os.getenv("EXTERNAL_STORAGE") .. "/fast_ai_voice_translator_lang.dat"
+    local f = io.open(langFile, "w")
+    if f then
+        f:write(code)
+        f:close()
+        service.speak("Language saved")
+    end
+end
+
+local languageItems = {
+    "Urdu (Pakistan)", "English (US)", "English (UK)", "Hindi (India)", "Arabic (Saudi Arabia)"
+}
+
+local languageCodes = {
+    "ur-PK", "en-US", "en-GB", "hi-IN", "ar-SA"
+}
+
+local editText = service.getEditText()
+
+function startVoiceTyping(langCode)
+    triggerVibration()
+    local context = service.getApplicationContext()
+    local speechRec = SpeechRecognizer.createSpeechRecognizer(context)
+    
+    local listener = RecognitionListener {
+        onResults = function(results)
+            local resultsArray = results.getParcelableArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+            if resultsArray and resultsArray.size() > 0 then
+                local spokenText = resultsArray.get(0)
+                
+                -- Dictionary corrections
+                for wrongWord, correctWord in pairs(changeTable) do
+                    spokenText = spokenText:gsub(wrongWord, correctWord)
+                end
+                
+                if isTranslateEnabled() then
+                    service.speak("Translating to " .. getTargetLanguageName() .. "...")
+                    translateSpeechToTarget(spokenText, function(translatedText)
+                        service.insertText(editText, translatedText)
+                        service.speak(translatedText)
+                    end)
+                else
+                    local apiKey = getGroqApiKey()
+                    if apiKey and apiKey ~= "" then
+                        processWithAI(spokenText, function(enhancedText)
+                            service.insertText(editText, enhancedText)
+                            service.speak(enhancedText)
+                        end)
+                    else
+                        service.insertText(editText, spokenText)
+                        service.speak(spokenText)
+                    end
+                end
+            end
+            speechRec.destroy()
+        end,
+        onError = function(errorCode)
+            service.speak("I did not understand your message")
+            speechRec.destroy()
+            return false
+        end,
+    }
+    
+    local intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+    intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+    intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, langCode)
+    speechRec.setRecognitionListener(listener)
+    speechRec.startListening(intent)
+end
+
+loadDictionary()
+
+if getSelectedMode() == "" then setSelectedMode("conversion") end
+translateEnabled = isTranslateEnabled()
+screenTranslateEnabled = isScreenTranslateEnabled()
+
+-- ==================== MAIN EXECUTION BLOCK ====================
+if editText then
+    startVoiceTyping(getSavedLanguage())
+else
+    if isScreenTranslateEnabled() then
+        local success = translateScreenFocusText()
+        if success then return true end
+    end
+
+    local dlg = LuaDialog(service)
+    dlg.setTitle("Fast AI Voice & Translator")
+    
+    local currentModeText = (getSelectedMode() == "conversion") and "Current: Conversion Mode" or "Current: Intelligent Mode"
+    local translateStateText = translateEnabled and "Translate: ON → " .. getTargetLanguageName() or "Translate: OFF"
+    local screenTranslateStateText = screenTranslateEnabled and "Screen Reader Translate: ON" or "Screen Reader Translate: OFF"
+    
+    local layout = {
+        LinearLayout;
+        orientation = "vertical";
+        padding = "30dp";
+        {
+            TextView;
+            text = "Fast AI Voice & Translator  |  " .. devName;
+            textSize = "14sp";
+            textColor = "#FFFFFFFF";
+            layout_width = "fill";
+            gravity = "center";
+            layout_marginBottom = "20dp";
+        };
+        {
+            Button;
+            text = "Select Language For Typing";
+            textSize = "16sp";
+            layout_width = "fill";
+            layout_marginBottom = "10dp";
+            onClick = function()
+                triggerVibration()
+                local listDlg = LuaDialog(service)
+                listDlg.setTitle("Select Language")
+                local list = ListView(service)
+                list.setAdapter(ArrayAdapter(service, android.R.layout.simple_list_item_1, languageItems))
+                list.onItemClick = function(l, v, p, i)
+                    triggerVibration()
+                    saveLanguage(languageCodes[p+1])
+                    listDlg.dismiss()
+                    service.speak("Language selected")
+                end
+                listDlg.setView(list)
+                listDlg.show()
+            end;
+        };
+        {
+            Button;
+            id = "translateToggle";
+            text = translateStateText;
+            textSize = "16sp";
+            layout_width = "fill";
+            layout_marginBottom = "10dp";
+            backgroundColor = "#2196F3";
+            textColor = "#FFFFFF";
+            onClick = function()
+                triggerVibration()
+                local newState = not isTranslateEnabled()
+                setTranslateEnabled(newState)
+                translateEnabled = newState
+                translateToggle.setText(newState and "Translate: ON → " .. getTargetLanguageName() or "Translate: OFF")
+                service.speak(newState and "Speech Translation enabled" or "Speech Translation disabled")
+            end;
+        };
+        {
+            Button;
+            text = "Set Translate Target Language";
+            textSize = "16sp";
+            layout_width = "fill";
+            layout_marginBottom = "10dp";
+            backgroundColor = "#4CAF50";
+            textColor = "#FFFFFF";
+            onClick = function()
+                triggerVibration()
+                dlg.dismiss()
+                showTranslateLanguageDialog(dlg)
+            end;
+        };
+        {
+            Button;
+            id = "screenTranslateToggle";
+            text = screenTranslateStateText;
+            textSize = "16sp";
+            layout_width = "fill";
+            layout_marginBottom = "10dp";
+            backgroundColor = "#9C27B0";
+            textColor = "#FFFFFF";
+            onClick = function()
+                triggerVibration()
+                local newState = not isScreenTranslateEnabled()
+                setScreenTranslateEnabled(newState)
+                screenTranslateEnabled = newState
+                screenTranslateToggle.setText(newState and "Screen Reader Translate: ON" or "Screen Reader Translate: OFF")
+                service.speak(newState and "Screen Translator active" or "Screen Translator disabled")
+            end;
+        };
+        {
+            Button;
+            text = "Settings";
+            textSize = "16sp";
+            layout_width = "fill";
+            layout_marginBottom = "10dp";
+            onClick = function()
+                triggerVibration()
+                dlg.dismiss()
+                showSettingsSubMenu(dlg)
+            end;
+        };
+        {
+            Button;
+            text = "About & Support";
+            textSize = "16sp";
+            layout_width = "fill";
+            layout_marginBottom = "10dp";
+            onClick = function()
+                triggerVibration()
+                dlg.dismiss()
+                showAboutSupportMenu(dlg)
+            end;
+        };
+        {
+            Button;
+            text = "Exit";
+            textSize = "16sp";
+            layout_width = "fill";
+            onClick = function() 
+                triggerVibration()
+                dlg.dismiss() 
+            end;
+        };
+    }
+    
+    dlg.setView(loadlayout(layout))
+    dlg.show()
+end 
